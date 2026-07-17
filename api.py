@@ -161,13 +161,11 @@ def limit(req: LimitRequest):
 
 @app.post("/recognize-formula")
 async def recognize_formula(file: UploadFile = File(...)):
-    """Fotoğraftaki matematiksel ifadeyi GPT-4o-mini ile okuyup, uygulamanın
-    zaten anladığı düz-metin syntax'ına (x^2 + sin(x) gibi) çevirir."""
     image_bytes = await file.read()
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     mime = file.content_type or "image/jpeg"
 
-       try:
+    try:
         response = _openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
