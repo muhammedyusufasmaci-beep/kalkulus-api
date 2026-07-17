@@ -167,7 +167,7 @@ async def recognize_formula(file: UploadFile = File(...)):
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     mime = file.content_type or "image/jpeg"
 
-    try:
+       try:
         response = _openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -178,14 +178,7 @@ async def recognize_formula(file: UploadFile = File(...)):
                             "type": "text",
                             "text": (
                                 "Bu görseldeki matematiksel ifadeyi oku. SADECE ifadeyi "
-                                "düz metin olarak yaz, başka hiçbir şey ekleme (açıklama, "
-                                "LaTeX, markdown, ``` işareti yok). Üs için ^ kullan "
-                                "(x^2 gibi), çarpma için * ya da bitişik yaz (2x veya 2*x), "
-                                "karekök için sqrt(...), fonksiyonlar için sin(x), cos(x), "
-                                "tan(x), ln(x), log(x) gibi standart isimler kullan. "
-                                "Kesirleri (pay)/(payda) şeklinde parantezli yaz. Tek "
-                                "değişken x olduğunu varsay. Örnek doğru çıktı: "
-                                "(x^2 + 3*x) / (x - 1)"
+                                "düz metin olarak yaz."
                             ),
                         },
                         {
@@ -199,8 +192,14 @@ async def recognize_formula(file: UploadFile = File(...)):
             temperature=0,
         )
         raw = (response.choices[0].message.content or "").strip()
-    except Exception:
-        raise HTTPException(status_code=502, detail="Görsel tanıma servisi şu an cevap vermiyor")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=502,
+            detail=f"{type(e).__name__}: {str(e)}"
+        )
 
     if not raw:
         raise HTTPException(status_code=422, detail="Görselde bir ifade bulunamadı")
@@ -215,6 +214,19 @@ async def recognize_formula(file: UploadFile = File(...)):
         raise HTTPException(status_code=422, detail=f"Okunan ifade anlaşılamadı: {cleaned}")
 
     return {"expression": cleaned}
+@app.get("/test-openai")
+def test_openai():
+    try:
+        models = _openai_client.models.list()
+        return {
+            "success": True,
+            "count": len(models.data)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"{type(e).__name__}: {str(e)}"
+        }
 
 
 @app.get("/")
