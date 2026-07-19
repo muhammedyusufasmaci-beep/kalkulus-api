@@ -1,172 +1,360 @@
-"""
-Mühendislik Ders Uygulaması - Kalkülüs API'si
-------------------------------------------------
-Türev, integral, limit hesaplamalarını SymPy ile yapan; her sonuç için
-grafik noktaları üreten; ve fotoğraftan matematiksel ifade okuyan
-(GPT-4o-mini ile) bir web servisi.
-"""
-
-import os
 import base64
+import os
+import re
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import sympy as sp
 import numpy as np
+import sympy as sp
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
+from pydantic import BaseModel, ConfigDict, Field
 from sympy.parsing.sympy_parser import (
+    implicit_multiplication_application,
     parse_expr,
     standard_transformations,
-    implicit_multiplication_application,
 )
-from openai import OpenAI
 
-# "2x" gibi ifadelerde çarpma işaretini otomatik anlaması için.
-_TRANSFORMATIONS = standard_transformations + (implicit_multiplication_application,)
+app = FastAPI(
+    title="Kalkülüs API",
+    version="2.0.0",
+    description="Türev, integral, limit, grafik ve formül okuma servisi.",
+)
 
-app = FastAPI(title="Kalkülüs API")
-
+# Yayına çıkınca buraya kendi web adresini yaz.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
-x = sp.symbols("x")
+x = sp.Symbol("x", real=True)
 
-# API anahtarını KODA YAZMIYORUZ, Render'da ortam değişkeni olarak
-# tanımlayacağız (aşağıda anlatıyorum).
-_openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+TRANSFORMATIONS = standard_transformations + (
+    implicit_multiplication_application,
+)
 
+SAFE_LOCALS = {
+    "x": x,
+    "pi": sp.pi,
+    "e": sp.E,
+    "E": sp.E,
+    "sin": sp.sin,
+    "cos": sp.cos,
+    "tan": sp.tan,
+    "sqrt": sp.sqrt,
+    "log": sp.log,
+    "ln": sp.log,
+    "exp": sp.exp,
+    "abs": sp.Abs,
+}
 
-def parse_expression(expr_str: str):
-    try:
-        cleaned = expr_str.replace("^", "**")
-        expr = parse_expr(cleaned, local_dict={"x": x}, transformations=_TRANSFORMATIONS)
-        return expr
-    except Exception:
-        raise HTTPException(status_code=400, detail="Geçersiz matematiksel ifade")
+SAFE_GLOBALS = {
+    "__builtins__": {},
+    "Symbol": sp.Symbol,
+    "Integer": sp.Integer,
+    "Float": sp.Float,
+    "Rational": sp.Rational,
+    "Function": sp.Function,
+}
 
-
-def sample_points(expr, x_min: float, x_max: float, n: int = 300):
-    try:
-        f = sp.lambdify(x, expr, modules=["numpy"])
-    except Exception:
-        return None
-
-    xs = np.linspace(x_min, x_max, n)
-    ys = []
-    for xv in xs:
-        try:
-            v = f(xv)
-            if isinstance(v, complex):
-                ys.append(None)
-            else:
-                fv = float(v)
-                if np.isnan(fv) or np.isinf(fv) or abs(fv) > 1e6:
-                    ys.append(None)
-                else:
-                    ys.append(fv)
-        except Exception:
-            ys.append(None)
-
-    return {"x": [float(v) for v in xs], "y": ys}
+ALLOWED_IDENTIFIERS = set(SAFE_LOCALS.keys())
 
 
 class ExpressionRequest(BaseModel):
-    expression: str
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    expression: str = Field(min_length=1, max_length=300)
 
 
-class IntegralRequest(BaseModel):
-    expression: str
+class IntegralRequest(ExpressionRequest):
     lower: float | None = None
     upper: float | None = None
+    include_steps: bool = False
 
 
-class LimitRequest(BaseModel):
-    expression: str
+class LimitRequest(ExpressionRequest):
     point: float
     direction: str = "both"
+
+
+def parse_expression(expression: str) -> sp.Expr:
+    cleaned = expression.strip().lower()
+    cleaned = cleaned.replace("^", "**").replace("×", "*").replace("÷", "/")
+
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="Matematiksel ifade boş olamaz.")
+
+    if len(cleaned) > 300:
+        raise HTTPException(status_code=400, detail="İfade çok uzun.")
+
+    if not re.fullmatch(r"[0-9a-z+\-*/^().,\s]+", cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail="İfade desteklenmeyen karakter içeriyor.",
+        )
+
+    identifiers = set(re.findall(r"[a-zA-Z_]+", cleaned))
+    unknown = identifiers - ALLOWED_IDENTIFIERS
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Desteklenmeyen ifade/fonksiyon: {', '.join(sorted(unknown))}",
+        )
+
+    try:
+        result = parse_expr(
+            cleaned,
+            local_dict=SAFE_LOCALS,
+            global_dict=SAFE_GLOBALS,
+            transformations=TRANSFORMATIONS,
+            evaluate=True,
+        )
+
+        if result.free_symbols - {x}:
+            raise ValueError("Sadece x değişkeni kullanılabilir.")
+
+        return result
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Geçersiz matematiksel ifade.",
+        )
+
+
+def text_result(value: Any) -> str:
+    return str(sp.simplify(value)).replace("**", "^")
+
+
+def sample_points(expr: sp.Expr, x_min: float, x_max: float, n: int = 300):
+    try:
+        function = sp.lambdify(x, expr, modules=["numpy"])
+        xs = np.linspace(x_min, x_max, n)
+        ys: list[float | None] = []
+
+        for point in xs:
+            try:
+                value = function(point)
+                number = float(value)
+
+                if not np.isfinite(number) or abs(number) > 1_000_000:
+                    ys.append(None)
+                else:
+                    ys.append(number)
+            except Exception:
+                ys.append(None)
+
+        return {
+            "x": [float(point) for point in xs],
+            "y": ys,
+        }
+    except Exception:
+        return None
+
+
+def make_integral_steps(
+    expression: str,
+    antiderivative: str,
+    lower: float | None = None,
+    upper: float | None = None,
+) -> list[str]:
+    compact = expression.replace(" ", "").replace("**", "^")
+    steps = [f"Verilen ifade: ∫({compact}) dx"]
+
+    if compact in {"1/x", "x^-1"}:
+        steps.append("Kural: ∫(1/x) dx = ln|x|.")
+    elif compact == "sin(x)":
+        steps.append("Kural: ∫sin(x) dx = -cos(x).")
+    elif compact == "cos(x)":
+        steps.append("Kural: ∫cos(x) dx = sin(x).")
+    elif compact in {"e^x", "exp(x)"}:
+        steps.append("Kural: ∫e^x dx = e^x.")
+    elif re.fullmatch(r"[+-]?(\d+\*?)?x(\^\d+)?", compact):
+        steps.append(
+            "Kuvvet kuralı uygulanır: ∫x^n dx = x^(n+1)/(n+1), n ≠ -1."
+        )
+    elif "+" in compact or "-" in compact[1:]:
+        steps.append(
+            "Toplam/fark kuralı uygulanır: Her terimin integrali ayrı alınır."
+        )
+    else:
+        steps.append(
+            "İfade SymPy ile sadeleştirilerek ilkel fonksiyon hesaplanır."
+        )
+
+    steps.append(f"İlkel fonksiyon: F(x) = {antiderivative}")
+
+    if lower is not None and upper is not None:
+        steps.append(
+            f"Temel teorem: ∫[{lower}, {upper}] f(x) dx = F({upper}) - F({lower})."
+        )
+        steps.append("Alt ve üst sınırlar ilkel fonksiyonda yerine konur.")
+    else:
+        steps.append("Belirsiz integral olduğu için sonuca + C sabiti eklenir.")
+
+    return steps
+
+
+@app.get("/")
+def health_check():
+    return {
+        "status": "ok",
+        "message": "Kalkülüs API çalışıyor",
+        "version": "2.0.0",
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.post("/derivative")
 def derivative(req: ExpressionRequest):
     expr = parse_expression(req.expression)
-    result = sp.diff(expr, x)
-    simplified = sp.simplify(result)
-    plot = sample_points(simplified, -10, 10)
+    result = sp.simplify(sp.diff(expr, x))
+
     return {
         "input": req.expression,
-        "result": str(simplified),
+        "result": text_result(result),
         "result_latex": sp.latex(result),
-        "plot": plot,
+        "plot": sample_points(expr, -10, 10),
     }
 
 
 @app.post("/integral")
 def integral(req: IntegralRequest):
+    if (req.lower is None) != (req.upper is None):
+        raise HTTPException(
+            status_code=400,
+            detail="Alt ve üst sınır birlikte girilmelidir.",
+        )
+
     expr = parse_expression(req.expression)
 
-    if req.lower is None or req.upper is None:
-        result = sp.integrate(expr, x)
-        plot = sample_points(expr, -10, 10)
+    if req.lower is None and req.upper is None:
+        result = sp.simplify(sp.integrate(expr, x))
+        result_text = text_result(result)
+
         return {
             "input": req.expression,
             "type": "belirsiz",
-            "result": str(sp.simplify(result)) + " + C",
-            "result_latex": sp.latex(result) + " + C",
-            "plot": plot,
+            "result": f"{result_text} + C",
+            "result_latex": f"{sp.latex(result)} + C",
+            "steps": (
+                make_integral_steps(req.expression, result_text)
+                if req.include_steps
+                else []
+            ),
+            "plot": sample_points(expr, -10, 10),
         }
-    else:
-        result = sp.integrate(expr, (x, req.lower, req.upper))
-        numeric_value = float(sp.N(result))
-        margin = max(1.0, (req.upper - req.lower) * 0.3)
-        plot = sample_points(expr, req.lower - margin, req.upper + margin)
-        return {
-            "input": req.expression,
-            "type": "belirli",
-            "lower": req.lower,
-            "upper": req.upper,
-            "result": str(result),
-            "numeric_value": numeric_value,
-            "plot": plot,
-        }
+
+    result = sp.simplify(sp.integrate(expr, (x, req.lower, req.upper)))
+
+    if result.has(sp.zoo, sp.oo, -sp.oo, sp.nan):
+        raise HTTPException(
+            status_code=400,
+            detail="Bu aralıkta integral sonlu bir değer vermiyor.",
+        )
+
+    numeric_value = float(sp.N(result))
+    margin = max(1.0, abs(req.upper - req.lower) * 0.3)
+
+    return {
+        "input": req.expression,
+        "type": "belirli",
+        "lower": req.lower,
+        "upper": req.upper,
+        "result": text_result(result),
+        "numeric_value": numeric_value,
+        "steps": (
+            make_integral_steps(
+                req.expression,
+                text_result(sp.integrate(expr, x)),
+                req.lower,
+                req.upper,
+            )
+            if req.include_steps
+            else []
+        ),
+        "plot": sample_points(expr, req.lower - margin, req.upper + margin),
+    }
 
 
 @app.post("/limit")
 def limit(req: LimitRequest):
-    expr = parse_expression(req.expression)
+    if req.direction not in {"left", "right", "both"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Yön left, right veya both olmalıdır.",
+        )
 
-    dir_map = {"left": "-", "right": "+", "both": "+-"}
-    sympy_dir = dir_map.get(req.direction, "+-")
+    expr = parse_expression(req.expression)
+    direction_map = {
+        "left": "-",
+        "right": "+",
+        "both": "+-",
+    }
 
     try:
-        result = sp.limit(expr, x, req.point, dir=sympy_dir)
+        result = sp.limit(expr, x, req.point, dir=direction_map[req.direction])
     except Exception:
         raise HTTPException(
             status_code=400,
-            detail="Limit hesaplanamadı (fonksiyon bu noktada tanımsız olabilir)",
+            detail="Limit hesaplanamadı.",
         )
 
-    plot = sample_points(expr, req.point - 5, req.point + 5)
     return {
         "input": req.expression,
         "point": req.point,
         "direction": req.direction,
-        "result": str(result),
-        "plot": plot,
+        "result": text_result(result),
+        "plot": sample_points(expr, req.point - 5, req.point + 5),
     }
+
+
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Formül okuma servisi yapılandırılmamış.",
+        )
+
+    return OpenAI(api_key=api_key)
 
 
 @app.post("/recognize-formula")
 async def recognize_formula(file: UploadFile = File(...)):
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=415,
+            detail="Sadece JPG, PNG veya WEBP görsel yükleyebilirsin.",
+        )
+
     image_bytes = await file.read()
-    b64 = base64.b64encode(image_bytes).decode("utf-8")
-    mime = file.content_type or "image/jpeg"
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Görsel boş.")
+
+    if len(image_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Görsel en fazla 8 MB olabilir.",
+        )
+
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
     try:
-        response = _openai_client.chat.completions.create(
+        client = get_openai_client()
+
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
@@ -175,58 +363,43 @@ async def recognize_formula(file: UploadFile = File(...)):
                         {
                             "type": "text",
                             "text": (
-                                "Bu görseldeki matematiksel ifadeyi oku. SADECE ifadeyi "
-                                "düz metin olarak yaz."
+                                "Görseldeki matematiksel ifadeyi oku. "
+                                "Sadece tek satır düz metin matematik ifadesi döndür. "
+                                "Açıklama, Markdown ve kod bloğu kullanma. "
+                                "Üs için ^, çarpma için *, karekök için sqrt kullan."
                             ),
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:{mime};base64,{b64}"},
+                            "image_url": {
+                                "url": (
+                                    f"data:{file.content_type};base64,{image_base64}"
+                                )
+                            },
                         },
                     ],
                 }
             ],
-            max_tokens=200,
             temperature=0,
+            max_tokens=150,
         )
-        raw = (response.choices[0].message.content or "").strip()
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+        raw = (response.choices[0].message.content or "").strip()
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(
             status_code=502,
-            detail=f"{type(e).__name__}: {str(e)}"
+            detail="Formül okuma servisi şu anda yanıt veremiyor.",
         )
-
-    if not raw:
-        raise HTTPException(status_code=422, detail="Görselde bir ifade bulunamadı")
 
     cleaned = raw.strip("`$ \n")
 
-    # Gerçekten SymPy tarafından anlaşılabiliyor mu diye önden kontrol
-    # ediyoruz — anlaşılmazsa kullanıcıya net bir mesaj dönüyoruz.
-    try:
-        parse_expression(cleaned)
-    except HTTPException:
-        raise HTTPException(status_code=422, detail=f"Okunan ifade anlaşılamadı: {cleaned}")
+    if not cleaned:
+        raise HTTPException(
+            status_code=422,
+            detail="Görselde okunabilir bir matematik ifadesi bulunamadı.",
+        )
 
+    parse_expression(cleaned)
     return {"expression": cleaned}
-@app.get("/test-openai")
-def test_openai():
-    try:
-        models = _openai_client.models.list()
-        return {
-            "success": True,
-            "count": len(models.data)
-        }
-    except Exception as e:
-        return {
-            "success": False,
-            "error": f"{type(e).__name__}: {str(e)}"
-        }
-
-
-@app.get("/")
-def health_check():
-    return {"status": "ok", "message": "Kalkülüs API çalışıyor"}
