@@ -17,11 +17,9 @@ from sympy.parsing.sympy_parser import (
 
 app = FastAPI(
     title="Kalkülüs API",
-    version="2.0.0",
-    description="Türev, integral, limit, grafik ve formül okuma servisi.",
+    version="2.1.0",
 )
 
-# Yayına çıkınca buraya kendi web adresini yaz.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,7 +37,6 @@ SAFE_LOCALS = {
     "x": x,
     "pi": sp.pi,
     "e": sp.E,
-    "E": sp.E,
     "sin": sp.sin,
     "cos": sp.cos,
     "tan": sp.tan,
@@ -97,10 +94,11 @@ def parse_expression(expression: str) -> sp.Expr:
 
     identifiers = set(re.findall(r"[a-zA-Z_]+", cleaned))
     unknown = identifiers - ALLOWED_IDENTIFIERS
+
     if unknown:
         raise HTTPException(
             status_code=400,
-            detail=f"Desteklenmeyen ifade/fonksiyon: {', '.join(sorted(unknown))}",
+            detail=f"Desteklenmeyen fonksiyon: {', '.join(sorted(unknown))}",
         )
 
     try:
@@ -116,6 +114,7 @@ def parse_expression(expression: str) -> sp.Expr:
             raise ValueError("Sadece x değişkeni kullanılabilir.")
 
         return result
+
     except HTTPException:
         raise
     except Exception:
@@ -151,6 +150,7 @@ def sample_points(expr: sp.Expr, x_min: float, x_max: float, n: int = 300):
             "x": [float(point) for point in xs],
             "y": ys,
         }
+
     except Exception:
         return None
 
@@ -162,6 +162,7 @@ def make_integral_steps(
     upper: float | None = None,
 ) -> list[str]:
     compact = expression.replace(" ", "").replace("**", "^")
+
     steps = [f"Verilen ifade: ∫({compact}) dx"]
 
     if compact in {"1/x", "x^-1"}:
@@ -174,15 +175,15 @@ def make_integral_steps(
         steps.append("Kural: ∫e^x dx = e^x.")
     elif re.fullmatch(r"[+-]?(\d+\*?)?x(\^\d+)?", compact):
         steps.append(
-            "Kuvvet kuralı uygulanır: ∫x^n dx = x^(n+1)/(n+1), n ≠ -1."
+            "Kuvvet kuralı: ∫x^n dx = x^(n+1)/(n+1), n ≠ -1."
         )
     elif "+" in compact or "-" in compact[1:]:
         steps.append(
-            "Toplam/fark kuralı uygulanır: Her terimin integrali ayrı alınır."
+            "Toplam/fark kuralı: Her terimin integrali ayrı alınır."
         )
     else:
         steps.append(
-            "İfade SymPy ile sadeleştirilerek ilkel fonksiyon hesaplanır."
+            "İfade sembolik integral yöntemiyle sadeleştirilir."
         )
 
     steps.append(f"İlkel fonksiyon: F(x) = {antiderivative}")
@@ -193,9 +194,21 @@ def make_integral_steps(
         )
         steps.append("Alt ve üst sınırlar ilkel fonksiyonda yerine konur.")
     else:
-        steps.append("Belirsiz integral olduğu için sonuca + C sabiti eklenir.")
+        steps.append("Belirsiz integral olduğu için sonuca + C eklenir.")
 
     return steps
+
+
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Formül okuma servisi yapılandırılmamış.",
+        )
+
+    return OpenAI(api_key=api_key)
 
 
 @app.get("/")
@@ -203,7 +216,7 @@ def health_check():
     return {
         "status": "ok",
         "message": "Kalkülüs API çalışıyor",
-        "version": "2.0.0",
+        "version": "2.1.0",
     }
 
 
@@ -237,6 +250,13 @@ def integral(req: IntegralRequest):
 
     if req.lower is None and req.upper is None:
         result = sp.simplify(sp.integrate(expr, x))
+
+        if result.has(sp.Integral):
+            raise HTTPException(
+                status_code=422,
+                detail="Bu integralin kapalı form çözümü bulunamadı.",
+            )
+
         result_text = text_result(result)
 
         return {
@@ -260,8 +280,16 @@ def integral(req: IntegralRequest):
             detail="Bu aralıkta integral sonlu bir değer vermiyor.",
         )
 
-    numeric_value = float(sp.N(result))
+    try:
+        numeric_value = float(sp.N(result))
+    except Exception:
+        raise HTTPException(
+            status_code=422,
+            detail="Bu belirli integral sayısal olarak hesaplanamadı.",
+        )
+
     margin = max(1.0, abs(req.upper - req.lower) * 0.3)
+    antiderivative = sp.simplify(sp.integrate(expr, x))
 
     return {
         "input": req.expression,
@@ -273,7 +301,7 @@ def integral(req: IntegralRequest):
         "steps": (
             make_integral_steps(
                 req.expression,
-                text_result(sp.integrate(expr, x)),
+                text_result(antiderivative),
                 req.lower,
                 req.upper,
             )
@@ -293,6 +321,7 @@ def limit(req: LimitRequest):
         )
 
     expr = parse_expression(req.expression)
+
     direction_map = {
         "left": "-",
         "right": "+",
@@ -314,18 +343,6 @@ def limit(req: LimitRequest):
         "result": text_result(result),
         "plot": sample_points(expr, req.point - 5, req.point + 5),
     }
-
-
-def get_openai_client() -> OpenAI:
-    api_key = os.getenv("OPENAI_API_KEY")
-
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="Formül okuma servisi yapılandırılmamış.",
-        )
-
-    return OpenAI(api_key=api_key)
 
 
 @app.post("/recognize-formula")
@@ -363,7 +380,7 @@ async def recognize_formula(file: UploadFile = File(...)):
                         {
                             "type": "text",
                             "text": (
-                                "Bu görseldeki matematiksel ifadeyi dikkatlice oku. "
+                                "Görseldeki matematiksel ifadeyi dikkatlice oku. "
                                 "SADECE matematiksel ifadeyi yaz. Açıklama, cümle, "
                                 "Markdown veya kod bloğu kullanma. "
                                 "Kesir için \\frac{pay}{payda}, karekök için \\sqrt{x}, "
@@ -404,8 +421,8 @@ async def recognize_formula(file: UploadFile = File(...)):
             detail="Görselde okunabilir bir matematik ifadesi bulunamadı.",
         )
 
-    # OCR sonucu LaTeX veya Unicode olabilir. Flutter uygulaması bunu
-    # güvenli hesap makinesi biçimine dönüştürüyor; burada erken reddetme.
+    # LaTeX/Unicode çıktısını burada reddetmiyoruz.
+    # Flutter tarafı bunu hesap makinesi biçimine dönüştürüyor.
     if len(cleaned) > 300:
         raise HTTPException(
             status_code=422,
