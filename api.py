@@ -363,10 +363,12 @@ async def recognize_formula(file: UploadFile = File(...)):
                         {
                             "type": "text",
                             "text": (
-                                "Görseldeki matematiksel ifadeyi oku. "
-                                "Sadece tek satır düz metin matematik ifadesi döndür. "
-                                "Açıklama, Markdown ve kod bloğu kullanma. "
-                                "Üs için ^, çarpma için *, karekök için sqrt kullan."
+                                "Bu görseldeki matematiksel ifadeyi dikkatlice oku. "
+                                "SADECE matematiksel ifadeyi yaz. Açıklama, cümle, "
+                                "Markdown veya kod bloğu kullanma. "
+                                "Kesir için \\frac{pay}{payda}, karekök için \\sqrt{x}, "
+                                "üs için ^ kullanabilirsin. "
+                                "Örnek: x^2+3*x veya \\frac{1}{x^2+1}."
                             ),
                         },
                         {
@@ -385,6 +387,7 @@ async def recognize_formula(file: UploadFile = File(...)):
         )
 
         raw = (response.choices[0].message.content or "").strip()
+
     except HTTPException:
         raise
     except Exception:
@@ -401,15 +404,12 @@ async def recognize_formula(file: UploadFile = File(...)):
             detail="Görselde okunabilir bir matematik ifadesi bulunamadı.",
         )
 
-    # OCR bazen LaTeX/Unicode biçiminde sonuç verir:
-# \frac{1}{2}, \sqrt{x}, π vb.
-# Flutter uygulaması bu biçimleri kendi FormulaNormalizer sınıfında
-# güvenli hesap makinesi biçimine dönüştürüyor.
-# Bu yüzden burada parse_expression ile erken reddetmiyoruz.
-if len(cleaned) > 300:
-    raise HTTPException(
-        status_code=422,
-        detail="Okunan ifade çok uzun.",
-    )
+    # OCR sonucu LaTeX veya Unicode olabilir. Flutter uygulaması bunu
+    # güvenli hesap makinesi biçimine dönüştürüyor; burada erken reddetme.
+    if len(cleaned) > 300:
+        raise HTTPException(
+            status_code=422,
+            detail="Okunan ifade çok uzun.",
+        )
 
-return {"expression": cleaned}
+    return {"expression": cleaned}
