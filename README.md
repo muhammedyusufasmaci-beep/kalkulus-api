@@ -1,6 +1,4 @@
 # kalkulus-api
-# Kalkülüs API
-
 Flutter mühendislik uygulaması için türev, integral, limit, grafik ve fotoğraftan formül okuma API'si.
 
 ## Render ayarları
