@@ -401,5 +401,15 @@ async def recognize_formula(file: UploadFile = File(...)):
             detail="Görselde okunabilir bir matematik ifadesi bulunamadı.",
         )
 
-    parse_expression(cleaned)
-    return {"expression": cleaned}
+    # OCR bazen LaTeX/Unicode biçiminde sonuç verir:
+# \frac{1}{2}, \sqrt{x}, π vb.
+# Flutter uygulaması bu biçimleri kendi FormulaNormalizer sınıfında
+# güvenli hesap makinesi biçimine dönüştürüyor.
+# Bu yüzden burada parse_expression ile erken reddetmiyoruz.
+if len(cleaned) > 300:
+    raise HTTPException(
+        status_code=422,
+        detail="Okunan ifade çok uzun.",
+    )
+
+return {"expression": cleaned}
